@@ -1,0 +1,6 @@
+# Dependencias del proyecto Metodos Numericos
+# tkinter, math, json, os, sys, ast, urllib ya vienen con Python.
+
+numpy>=1.24
+matplotlib>=3.7
+pandas>=2.0

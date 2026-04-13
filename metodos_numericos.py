@@ -7,6 +7,7 @@ Autor: Estudiante de Métodos Numéricos
 
 import math
 import os
+import ast
 from typing import Callable, List, Tuple, Union
 
 
@@ -247,13 +248,15 @@ class MetodosNumericos:
                 )
             }
         
+        c_anterior = None
+
         for iteracion in range(max_iter):
             fa = f(a)
             fb = f(b)
             
             c = a - fa * (b - a) / (fb - fa)
             fc = f(c)
-            error = abs(b - a)
+            error = abs(c - c_anterior) if c_anterior is not None else abs(b - a)
             
             resultados.append({
                 "iteracion": iteracion + 1,
@@ -276,6 +279,8 @@ class MetodosNumericos:
                 b = c
             else:
                 a = c
+
+            c_anterior = c
         
         return {
             "raiz": c,
@@ -769,15 +774,99 @@ class Consola:
         self.mn = MetodosNumericos()
 
     def _math_env(self, **kwargs):
-        """Entorno para eval: expone sin, cos, tan, pi, e, sqrt, etc. sin prefijo y también math.xxx"""
+        """Entorno de funciones matemáticas permitidas para evaluación segura."""
         env = vars(math).copy()
-        env["math"] = math
+        env.update({
+            "sen": math.sin,
+            "tg": math.tan,
+            "ln": math.log,
+            "raiz": math.sqrt,
+            "arcsen": math.asin,
+            "arctg": math.atan,
+            "abs": abs,
+        })
         env.update(kwargs)
         return env
 
+    def _normalizar_expr(self, expr: str) -> str:
+        texto = (expr or "").strip()
+        if not texto:
+            return texto
+
+        reemplazos = {
+            "√(": "sqrt(",
+            "√": "sqrt",
+            "^": "**",
+            "π": "pi",
+            "²": "**2",
+            "³": "**3",
+        }
+        for viejo, nuevo in reemplazos.items():
+            texto = texto.replace(viejo, nuevo)
+
+        aliases = {
+            "sen": "sin",
+            "tg": "tan",
+            "ln": "log",
+            "raiz": "sqrt",
+            "arcsen": "asin",
+            "arctg": "atan",
+        }
+        for alias, real in aliases.items():
+            texto = texto.replace(alias, real)
+
+        return texto
+
+    def _validar_ast_matematico(self, tree: ast.AST, nombres_permitidos: set):
+        permitidos = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Call,
+            ast.Name,
+            ast.Load,
+            ast.Constant,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Pow,
+            ast.Mod,
+            ast.FloorDiv,
+            ast.USub,
+            ast.UAdd,
+        )
+
+        for nodo in ast.walk(tree):
+            if isinstance(nodo, ast.Call):
+                if not isinstance(nodo.func, ast.Name):
+                    raise ValueError("Solo se permiten llamadas directas a funciones matemáticas")
+                if nodo.func.id not in nombres_permitidos:
+                    raise NameError(f"Función no permitida: {nodo.func.id}")
+                continue
+
+            if isinstance(nodo, ast.Name):
+                if nodo.id not in nombres_permitidos:
+                    raise NameError(f"Símbolo no permitido: {nodo.id}")
+                continue
+
+            if not isinstance(nodo, permitidos):
+                raise ValueError(f"Sintaxis no permitida: {type(nodo).__name__}")
+
+    def _eval_expr(self, expr: str, **kwargs):
+        expr_normalizada = self._normalizar_expr(expr)
+        if not expr_normalizada:
+            raise ValueError("La expresión está vacía")
+
+        env = self._math_env(**kwargs)
+        tree = ast.parse(expr_normalizada, mode="eval")
+        self._validar_ast_matematico(tree, set(env.keys()))
+        compiled = compile(tree, "<expresion>", "eval")
+        return eval(compiled, {"__builtins__": {}}, env)
+
     def _eval_num(self, texto: str) -> float:
         """Convierte una expresión numérica a float. Acepta: 3.14, pi, math.pi, 2*pi, etc."""
-        return float(eval(texto.strip(), self._math_env()))
+        return float(self._eval_expr(texto.strip()))
 
     def limpiar_pantalla(self):
         """Limpia la pantalla"""
@@ -864,7 +953,7 @@ class Consola:
             tol = float(input("Tolerancia (por defecto 1e-6): ") or "1e-6")
             max_iter = int(input("Máximo de iteraciones (por defecto 100): ") or "100")
             
-            f = lambda x: eval(funcion_str, self._math_env(x=x))
+            f = lambda x: self._eval_expr(funcion_str, x=x)
             resultado = self.mn.biseccion(f, a, b, tol, max_iter)
             
             self.mostrar_resultado(resultado)
@@ -887,8 +976,8 @@ class Consola:
             tol = float(input("Tolerancia (por defecto 1e-6): ") or "1e-6")
             max_iter = int(input("Máximo de iteraciones (por defecto 100): ") or "100")
             
-            f = lambda x: eval(funcion_str, self._math_env(x=x))
-            df = lambda x: eval(derivada_str, self._math_env(x=x))
+            f = lambda x: self._eval_expr(funcion_str, x=x)
+            df = lambda x: self._eval_expr(derivada_str, x=x)
             resultado = self.mn.newton_raphson(f, df, x0, tol, max_iter)
             
             self.mostrar_resultado(resultado)
@@ -911,7 +1000,7 @@ class Consola:
             tol = float(input("Tolerancia (por defecto 1e-6): ") or "1e-6")
             max_iter = int(input("Máximo de iteraciones (por defecto 100): ") or "100")
             
-            f = lambda x: eval(funcion_str, self._math_env(x=x))
+            f = lambda x: self._eval_expr(funcion_str, x=x)
             resultado = self.mn.secante(f, x0, x1, tol, max_iter)
             
             self.mostrar_resultado(resultado)
@@ -934,7 +1023,7 @@ class Consola:
             tol = float(input("Tolerancia (por defecto 1e-6): ") or "1e-6")
             max_iter = int(input("Máximo de iteraciones (por defecto 100): ") or "100")
             
-            f = lambda x: eval(funcion_str, self._math_env(x=x))
+            f = lambda x: self._eval_expr(funcion_str, x=x)
             resultado = self.mn.falsa_posicion(f, a, b, tol, max_iter)
             
             self.mostrar_resultado(resultado)
@@ -1056,7 +1145,7 @@ class Consola:
             b = self._eval_num(input("Límite superior (b): "))
             n = int(input("Número de subintervalos (por defecto 100): ") or "100")
             
-            f = lambda x: eval(funcion_str, self._math_env(x=x))
+            f = lambda x: self._eval_expr(funcion_str, x=x)
             resultado = self.mn.trapecio(f, a, b, n)
             
             self.mostrar_resultado(resultado)
@@ -1078,7 +1167,7 @@ class Consola:
             b = self._eval_num(input("Límite superior (b): "))
             n = int(input("Número de subintervalos (por defecto 100): ") or "100")
             
-            f = lambda x: eval(funcion_str, self._math_env(x=x))
+            f = lambda x: self._eval_expr(funcion_str, x=x)
             resultado = self.mn.simpson_1_3(f, a, b, n)
             
             self.mostrar_resultado(resultado)
@@ -1100,7 +1189,7 @@ class Consola:
             b = self._eval_num(input("Límite superior (b): "))
             n = int(input("Número de subintervalos (por defecto 99): ") or "99")
             
-            f = lambda x: eval(funcion_str, self._math_env(x=x))
+            f = lambda x: self._eval_expr(funcion_str, x=x)
             resultado = self.mn.simpson_3_8(f, a, b, n)
             
             self.mostrar_resultado(resultado)
@@ -1241,7 +1330,7 @@ class Consola:
             x = self._eval_num(input("Punto (x): "))
             h = float(input("Paso (h, por defecto 1e-5): ") or "1e-5")
             
-            f = lambda t: eval(funcion_str, self._math_env(x=t))
+            f = lambda t: self._eval_expr(funcion_str, x=t)
             resultado = self.mn.diferencia_progresiva(f, x, h)
             
             self.mostrar_resultado(resultado)
@@ -1262,7 +1351,7 @@ class Consola:
             x = self._eval_num(input("Punto (x): "))
             h = float(input("Paso (h, por defecto 1e-5): ") or "1e-5")
             
-            f = lambda t: eval(funcion_str, self._math_env(x=t))
+            f = lambda t: self._eval_expr(funcion_str, x=t)
             resultado = self.mn.diferencia_regresiva(f, x, h)
             
             self.mostrar_resultado(resultado)
@@ -1283,7 +1372,7 @@ class Consola:
             x = self._eval_num(input("Punto (x): "))
             h = float(input("Paso (h, por defecto 1e-5): ") or "1e-5")
             
-            f = lambda t: eval(funcion_str, self._math_env(x=t))
+            f = lambda t: self._eval_expr(funcion_str, x=t)
             resultado = self.mn.diferencia_central(f, x, h)
             
             self.mostrar_resultado(resultado)
@@ -1332,7 +1421,7 @@ class Consola:
             xf = self._eval_num(input("Valor final de x (xf): "))
             h = float(input("Paso (h, por defecto 0.1): ") or "0.1")
             
-            f = lambda x, y: eval(funcion_str, self._math_env(x=x, y=y))
+            f = lambda x, y: self._eval_expr(funcion_str, x=x, y=y)
             resultado = self.mn.euler(f, x0, y0, xf, h)
             
             self.mostrar_resultado(resultado)
@@ -1357,7 +1446,7 @@ class Consola:
             xf = self._eval_num(input("Valor final de x (xf): "))
             h = float(input("Paso (h, por defecto 0.1): ") or "0.1")
             
-            f = lambda x, y: eval(funcion_str, self._math_env(x=x, y=y))
+            f = lambda x, y: self._eval_expr(funcion_str, x=x, y=y)
             resultado = self.mn.runge_kutta_4(f, x0, y0, xf, h)
             
             self.mostrar_resultado(resultado)

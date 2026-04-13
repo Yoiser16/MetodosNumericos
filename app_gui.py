@@ -12,8 +12,10 @@ import re
 import sys
 import os
 import time
+import ast
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 try:
     import pandas as pd
@@ -157,9 +159,8 @@ def _guardar_ultimos_calculos(data: dict):
 
 
 def math_env(**kwargs):
-    """Entorno seguro para eval con funciones matemáticas disponibles."""
+    """Entorno de funciones matemáticas permitidas para evaluación segura."""
     env = vars(math).copy()
-    env["math"] = math
     env.update({
         "sen": math.sin,
         "tg": math.tan,
@@ -167,9 +168,83 @@ def math_env(**kwargs):
         "raiz": math.sqrt,
         "arcsen": math.asin,
         "arctg": math.atan,
+        "abs": abs,
     })
     env.update(kwargs)
     return env
+
+
+ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Call,
+    ast.Name,
+    ast.Load,
+    ast.Constant,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Pow,
+    ast.Mod,
+    ast.FloorDiv,
+    ast.USub,
+    ast.UAdd,
+)
+
+
+def _validar_ast_matematico(tree: ast.AST, nombres_permitidos: set):
+    """Valida que la expresión use solo sintaxis y símbolos matemáticos permitidos."""
+    for nodo in ast.walk(tree):
+        if isinstance(nodo, ast.Call):
+            if not isinstance(nodo.func, ast.Name):
+                raise ValueError("Solo se permiten llamadas directas a funciones matemáticas")
+            if nodo.func.id not in nombres_permitidos:
+                raise NameError(f"Función no permitida: {nodo.func.id}")
+            continue
+
+        if isinstance(nodo, ast.Name):
+            if nodo.id not in nombres_permitidos:
+                raise NameError(f"Símbolo no permitido: {nodo.id}")
+            continue
+
+        if not isinstance(nodo, ALLOWED_AST_NODES):
+            raise ValueError(f"Sintaxis no permitida: {type(nodo).__name__}")
+
+
+def _evaluar_expresion_segura(expr: str, **variables):
+    """Evalúa expresiones matemáticas sin exponer builtins ni atributos de Python."""
+    expr_normalizada = normalizar_expresion(expr)
+    if not expr_normalizada:
+        raise ValueError("La expresión está vacía")
+
+    entorno = math_env(**variables)
+    nombres_permitidos = set(entorno.keys())
+
+    try:
+        tree = ast.parse(expr_normalizada, mode="eval")
+    except SyntaxError as exc:
+        raise SyntaxError(str(exc)) from exc
+
+    _validar_ast_matematico(tree, nombres_permitidos)
+    compiled = compile(tree, "<expresion>", "eval")
+    return eval(compiled, {"__builtins__": {}}, entorno)
+
+
+def _validar_url_api(api_url: str):
+    """Valida formato básico de endpoint para evitar envío accidental a URLs inseguras."""
+    url_limpia = (api_url or "").strip()
+    if not url_limpia:
+        return False, "La URL de la API no puede estar vacía."
+
+    parsed = urlparse(url_limpia)
+    if parsed.scheme.lower() != "https":
+        return False, "La URL debe usar HTTPS."
+    if not parsed.netloc:
+        return False, "La URL de la API no es válida."
+
+    return True, ""
 
 
 def normalizar_expresion(expr: str) -> str:
@@ -205,19 +280,19 @@ def normalizar_expresion(expr: str) -> str:
 
 def eval_num(texto: str) -> float:
     """Evalúa una expresión numérica (acepta pi, math.pi, 2*pi, etc.)."""
-    return float(eval(normalizar_expresion(texto), math_env()))
+    return float(_evaluar_expresion_segura(texto))
 
 
 def eval_func(expr: str):
     """Retorna un lambda f(x) evaluando la expresión."""
     expr_normalizada = normalizar_expresion(expr)
-    return lambda x: eval(expr_normalizada, math_env(x=x))
+    return lambda x: _evaluar_expresion_segura(expr_normalizada, x=x)
 
 
 def eval_func2(expr: str):
     """Retorna un lambda f(x, y) evaluando la expresión."""
     expr_normalizada = normalizar_expresion(expr)
-    return lambda x, y: eval(expr_normalizada, math_env(x=x, y=y))
+    return lambda x, y: _evaluar_expresion_segura(expr_normalizada, x=x, y=y)
 
 
 def sugerir_sintaxis_local(expr: str, variables=("x",)):
@@ -283,6 +358,10 @@ def _consultar_modelo_json(system_prompt: str, user_prompt: str):
 
     api_url = os.getenv("OPENAI_API_URL") or os.getenv("IA_API_URL") or "https://api.openai.com/v1/chat/completions"
     model = os.getenv("OPENAI_MODEL") or os.getenv("IA_MODEL") or "gpt-5.4"
+    url_valida, error_url = _validar_url_api(api_url)
+    if not url_valida:
+        return None, error_url
+
     payload = {
         "model": model,
         "messages": [
@@ -290,8 +369,15 @@ def _consultar_modelo_json(system_prompt: str, user_prompt: str):
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
+        "max_tokens": 500,
         "response_format": {"type": "json_object"},
     }
+
+    timeout_segundos = 8.0
+    try:
+        timeout_segundos = float(os.getenv("IA_TIMEOUT", "8"))
+    except Exception:
+        timeout_segundos = 8.0
 
     req = urllib.request.Request(
         api_url,
@@ -306,7 +392,7 @@ def _consultar_modelo_json(system_prompt: str, user_prompt: str):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=timeout_segundos) as response:
             body = json.loads(response.read().decode("utf-8"))
         content = body["choices"][0]["message"]["content"]
         data = json.loads(content)
@@ -321,17 +407,33 @@ def _consultar_modelo_json(system_prompt: str, user_prompt: str):
 
 def consultar_ia_sintaxis(expr: str, detalle_error: str, variables=("x",)):
     """Consulta un modelo por API para sugerir una corrección de sintaxis."""
+    nivel = (os.getenv("IA_DETAIL_LEVEL") or "intermedio").strip().lower()
+    if nivel not in {"basico", "intermedio", "profundo"}:
+        nivel = "intermedio"
+
+    instruccion_nivel = {
+        "basico": "Mantén la respuesta breve (máximo 2 pasos).",
+        "intermedio": "Da detalle moderado (2 a 4 pasos, con contexto útil).",
+        "profundo": "Da explicación completa, destacando causa, validación y alternativas.",
+    }[nivel]
+
     prompt = (
         "Eres un asistente experto en sintaxis matemática para estudiantes de métodos numéricos. "
         "Debes corregir expresiones escritas por usuarios en Python matemático. "
-        "Responde en JSON con las claves suggestion y explanation. "
-        "La sugerencia debe ser una única expresión válida y breve. "
+        "Responde en JSON con las claves: suggestion, explanation, probable_cause, pasos, alternativas, confidence. "
+        "suggestion debe ser una única expresión válida en Python. "
+        "explanation debe ser clara y breve. "
+        "probable_cause debe explicar por qué ocurrió el error. "
+        "pasos debe ser una lista de 2 a 4 acciones concretas. "
+        "alternativas debe ser una lista de hasta 3 formas equivalentes válidas. "
+        "confidence debe ser un número entre 0 y 1. "
+        f"Nivel de detalle solicitado: {nivel}. {instruccion_nivel} "
         "Variables permitidas: " + ", ".join(variables) + ". "
         f"Expresión original: {expr}. "
         f"Error detectado: {detalle_error}."
     )
     data, error = _consultar_modelo_json(
-        "Corrige expresiones matemáticas para Python y responde solo JSON válido.",
+        "Corrige expresiones matemáticas para Python. Responde solo JSON válido y útil para estudiantes.",
         prompt,
     )
     if error:
@@ -340,10 +442,32 @@ def consultar_ia_sintaxis(expr: str, detalle_error: str, variables=("x",)):
     try:
         suggestion = str(data.get("suggestion", "")).strip()
         explanation = str(data.get("explanation", "")).strip()
+        probable_cause = str(data.get("probable_cause", "")).strip()
+        pasos = data.get("pasos", [])
+        if not isinstance(pasos, list):
+            pasos = [str(pasos)] if pasos else []
+        pasos = [str(p).strip() for p in pasos if str(p).strip()][:4]
+
+        alternativas = data.get("alternativas", [])
+        if not isinstance(alternativas, list):
+            alternativas = [str(alternativas)] if alternativas else []
+        alternativas = [str(a).strip() for a in alternativas if str(a).strip()][:3]
+
+        confidence_raw = data.get("confidence", "")
+        try:
+            confidence = float(confidence_raw)
+            confidence = max(0.0, min(1.0, confidence))
+        except Exception:
+            confidence = None
+
         if suggestion:
             return {
                 "suggestion": suggestion,
                 "explanation": explanation or "La IA encontró una forma válida de escribir la expresión.",
+                "probable_cause": probable_cause,
+                "pasos": pasos,
+                "alternativas": alternativas,
+                "confidence": confidence,
                 "model": data.get("model", "desconocido"),
             }, None
         return None, "La IA no devolvió una sugerencia utilizable."
@@ -353,18 +477,34 @@ def consultar_ia_sintaxis(expr: str, detalle_error: str, variables=("x",)):
 
 def consultar_ia_contexto(detalle_error: str, contexto: str = "", datos=None):
     """Pide a la IA una explicación y una acción sugerida para cualquier error del sistema."""
+    nivel = (os.getenv("IA_DETAIL_LEVEL") or "intermedio").strip().lower()
+    if nivel not in {"basico", "intermedio", "profundo"}:
+        nivel = "intermedio"
+
+    instruccion_nivel = {
+        "basico": "Mantén la respuesta breve y directa.",
+        "intermedio": "Incluye explicación y pasos prácticos sin extenderte de más.",
+        "profundo": "Da diagnóstico amplio con pasos, validaciones y observaciones de riesgo.",
+    }[nivel]
+
     datos_txt = json.dumps(datos or {}, ensure_ascii=False)
     prompt = (
         "Eres un asistente para una app de métodos numéricos. "
         "Debes ayudar al estudiante a entender el error y qué corregir. "
-        "Responde en JSON con las claves suggestion y explanation. "
-        "La sugerencia debe ser una acción concreta y breve. "
+        "Responde en JSON con las claves: suggestion, explanation, probable_cause, pasos, checklist, confidence. "
+        "suggestion debe ser la acción principal recomendada. "
+        "explanation debe explicar el error con lenguaje simple. "
+        "probable_cause debe indicar la causa técnica probable. "
+        "pasos debe ser una lista de 2 a 4 acciones concretas. "
+        "checklist debe ser una lista corta de validaciones previas al recálculo. "
+        "confidence debe ser un número entre 0 y 1. "
+        f"Nivel de detalle solicitado: {nivel}. {instruccion_nivel} "
         f"Contexto: {contexto or 'general'}. "
         f"Detalle del error: {detalle_error}. "
         f"Datos adicionales: {datos_txt}."
     )
     data, error = _consultar_modelo_json(
-        "Explica errores de métodos numéricos y responde solo JSON válido.",
+        "Explica errores de métodos numéricos para estudiantes. Responde solo JSON válido y accionable.",
         prompt,
     )
     if error:
@@ -372,10 +512,33 @@ def consultar_ia_contexto(detalle_error: str, contexto: str = "", datos=None):
 
     suggestion = str(data.get("suggestion", "")).strip()
     explanation = str(data.get("explanation", "")).strip()
+    probable_cause = str(data.get("probable_cause", "")).strip()
+
+    pasos = data.get("pasos", [])
+    if not isinstance(pasos, list):
+        pasos = [str(pasos)] if pasos else []
+    pasos = [str(p).strip() for p in pasos if str(p).strip()][:4]
+
+    checklist = data.get("checklist", [])
+    if not isinstance(checklist, list):
+        checklist = [str(checklist)] if checklist else []
+    checklist = [str(c).strip() for c in checklist if str(c).strip()][:4]
+
+    confidence_raw = data.get("confidence", "")
+    try:
+        confidence = float(confidence_raw)
+        confidence = max(0.0, min(1.0, confidence))
+    except Exception:
+        confidence = None
+
     if suggestion or explanation:
         return {
             "suggestion": suggestion or "Revisa los datos de entrada y vuelve a intentar.",
             "explanation": explanation or "La IA detectó que hace falta corregir la entrada antes de continuar.",
+            "probable_cause": probable_cause,
+            "pasos": pasos,
+            "checklist": checklist,
+            "confidence": confidence,
             "model": data.get("model", "desconocido"),
         }, None
     return None, "La IA no devolvió una orientación utilizable."
@@ -735,6 +898,110 @@ class App(tk.Tk):
 
         return -10, 10
 
+    def _metodo_historial_actual(self):
+        """Mapea el nombre del panel activo al identificador interno de historial."""
+        mapa = {
+            "Bisección": "biseccion",
+            "Newton-Raphson": "newton",
+            "Secante": "secante",
+            "Falsa Posición": "falsa_posicion",
+            "Trapecio": "trapecio",
+            "Simpson 1/3": "simpson13",
+            "Simpson 3/8": "simpson38",
+            "Dif. Progresiva": "dif_prog",
+            "Dif. Regresiva": "dif_reg",
+            "Dif. Central": "dif_central",
+        }
+        return mapa.get(self._metodo_actual)
+
+    def _obtener_contexto_funcion_actual(self):
+        """Obtiene expresión y rango para graficar según el último cálculo del panel activo."""
+        metodo = self._metodo_historial_actual()
+        if not metodo:
+            return None, "Este método no tiene función f(x) para graficar en forma combinada."
+
+        data = self._ultimos_calculos.get(metodo, {})
+        entradas = data.get("entradas", {}) if isinstance(data, dict) else {}
+        expr = str(entradas.get("fx", "")).strip()
+        if not expr:
+            return None, "Primero calcula un método que tenga función f(x)."
+
+        try:
+            if "a" in entradas and "b" in entradas:
+                a = eval_num(str(entradas.get("a", "-10")))
+                b = eval_num(str(entradas.get("b", "10")))
+                if a == b:
+                    a, b = a - 1, b + 1
+                if a > b:
+                    a, b = b, a
+                return (expr, a, b), None
+
+            if "x0" in entradas and "x1" in entradas:
+                x0 = eval_num(str(entradas.get("x0", "-1")))
+                x1 = eval_num(str(entradas.get("x1", "1")))
+                m = (x0 + x1) / 2
+                r = max(abs(x1 - x0), 1.0)
+                return (expr, m - 2 * r, m + 2 * r), None
+
+            if "x0" in entradas:
+                x0 = eval_num(str(entradas.get("x0", "0")))
+                return (expr, x0 - 5, x0 + 5), None
+        except Exception:
+            pass
+
+        return (expr, -10, 10), None
+
+    def _obtener_serie_error(self, txt):
+        """Extrae la serie de error por iteración del resultado mostrado."""
+        filas = getattr(txt, "_ultimo_dataframe", None) or []
+        if not filas:
+            resultado = getattr(txt, "_ultimo_resultado", None) or {}
+            filas = resultado.get("resultados", []) if isinstance(resultado, dict) else []
+
+        if not filas:
+            return None, "Este resultado no tiene iteraciones para graficar el error."
+
+        primer = filas[0] if isinstance(filas[0], dict) else {}
+        if not isinstance(primer, dict):
+            return None, "Formato de resultados no compatible para graficar error."
+
+        clave_error = None
+        for clave in primer.keys():
+            if "error" in str(clave).lower():
+                clave_error = clave
+                break
+
+        if not clave_error:
+            return None, "No se encontró una columna de error en las iteraciones."
+
+        xs = []
+        ys = []
+        for idx, fila in enumerate(filas, start=1):
+            if not isinstance(fila, dict):
+                continue
+            valor_error = fila.get(clave_error)
+            try:
+                y = float(valor_error)
+            except Exception:
+                continue
+
+            if not math.isfinite(y):
+                continue
+
+            it = fila.get("iteracion", idx)
+            try:
+                x = int(it)
+            except Exception:
+                x = idx
+
+            xs.append(x)
+            ys.append(y)
+
+        if not xs:
+            return None, "No hay valores numéricos de error para graficar."
+
+        return (clave_error, xs, ys), None
+
     def _graficar_funcion(self, expr, a, b):
         if not MATPLOTLIB_DISPONIBLE:
             messagebox.showerror(
@@ -768,6 +1035,86 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error al graficar", str(e))
 
+    def _graficar_error_iteraciones(self, txt):
+        """Grafica el error por iteración usando el último resultado del panel."""
+        if not MATPLOTLIB_DISPONIBLE:
+            messagebox.showerror(
+                "Matplotlib no disponible",
+                "No se pudo importar matplotlib/numpy.\n"
+                "Instala con: pip install matplotlib numpy"
+            )
+            return
+
+        serie, error = self._obtener_serie_error(txt)
+        if not serie:
+            messagebox.showwarning("Sin datos de error", error)
+            return
+
+        clave_error, xs, ys = serie
+
+        plt.figure("Grafica de error", figsize=(8, 4.8))
+        plt.plot(xs, ys, marker="o", linewidth=1.8, color=T["ACCENT2"])
+        plt.title(f"Error por iteración ({clave_error})")
+        plt.xlabel("Iteración")
+        plt.ylabel("Error")
+        plt.grid(True, alpha=0.25)
+        plt.tight_layout()
+        plt.show()
+
+    def _graficar_funcion_y_error(self, txt):
+        """Grafica en una sola ventana la función f(x) y el error por iteración."""
+        if not MATPLOTLIB_DISPONIBLE:
+            messagebox.showerror(
+                "Matplotlib no disponible",
+                "No se pudo importar matplotlib/numpy.\n"
+                "Instala con: pip install matplotlib numpy"
+            )
+            return
+
+        contexto, error_ctx = self._obtener_contexto_funcion_actual()
+        if not contexto:
+            messagebox.showwarning("Sin función", error_ctx)
+            return
+
+        serie, error_serie = self._obtener_serie_error(txt)
+        if not serie:
+            messagebox.showwarning("Sin datos de error", error_serie)
+            return
+
+        expr, a, b = contexto
+        clave_error, xs_err, ys_err = serie
+
+        try:
+            f = eval_func(expr)
+            xs = np.linspace(a, b, 800)
+            ys = []
+            for x in xs:
+                try:
+                    ys.append(float(f(float(x))))
+                except Exception:
+                    ys.append(np.nan)
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 7), sharex=False)
+
+            ax1.plot(xs, ys, color=T["ACCENT"], linewidth=2)
+            ax1.axhline(0, color=T["SUBTEXT"], linewidth=1)
+            ax1.axvline(0, color=T["SUBTEXT"], linewidth=1)
+            ax1.set_title(f"f(x) = {expr}")
+            ax1.set_xlabel("x")
+            ax1.set_ylabel("f(x)")
+            ax1.grid(True, alpha=0.25)
+
+            ax2.plot(xs_err, ys_err, marker="o", linewidth=1.8, color=T["ACCENT2"])
+            ax2.set_title(f"Error por iteración ({clave_error})")
+            ax2.set_xlabel("Iteración")
+            ax2.set_ylabel("Error")
+            ax2.grid(True, alpha=0.25)
+
+            fig.tight_layout()
+            plt.show()
+        except Exception as exc:
+            messagebox.showerror("Error al graficar", str(exc))
+
     def _boton_graficar(self, parent, var_fx, var_a=None, var_b=None, var_x0=None, var_x1=None):
         def graficar():
             try:
@@ -797,6 +1144,24 @@ class App(tk.Tk):
             relief="flat", bd=0, padx=10, pady=10,
             state="disabled", wrap="word"
         )
+
+        btn_combo = tk.Button(
+            header, text="Graficar f(x)+error", font=("Segoe UI", 8, "bold"),
+            bg=T["ACCENT2"], fg=T["BG"], relief="flat", cursor="hand2",
+            activebackground=T["BTN_HOVER"], activeforeground=T["BG"],
+            padx=10, pady=4,
+            command=lambda t=txt: self._graficar_funcion_y_error(t)
+        )
+        btn_combo.pack(side="right", padx=(0, 6))
+
+        btn_error = tk.Button(
+            header, text="Graficar error", font=("Segoe UI", 8, "bold"),
+            bg=T["ACCENT"], fg=T["BG"], relief="flat", cursor="hand2",
+            activebackground=T["BTN_HOVER"], activeforeground=T["BG"],
+            padx=10, pady=4,
+            command=lambda t=txt: self._graficar_error_iteraciones(t)
+        )
+        btn_error.pack(side="right", padx=(0, 6))
 
         btn_exportar = tk.Button(
             header, text="Exportar DataFrame a Excel", font=("Segoe UI", 8, "bold"),
@@ -983,18 +1348,43 @@ class App(tk.Tk):
                 respuesta = None
 
             if respuesta:
+                pasos = respuesta.get("pasos", [])
+                alternativas = respuesta.get("alternativas", [])
+                probable_cause = respuesta.get("probable_cause", "")
+                confidence = respuesta.get("confidence", None)
+
                 titulo = "🤖  Alerta generada por IA"
                 detalle = (
                     f"  → Exprésalo así: {respuesta['suggestion']}\n"
                     f"  → {respuesta['explanation']}\n"
-                    f"  → Modelo consultado: {respuesta['model']}"
                 )
+                if probable_cause:
+                    detalle += f"  → Causa probable: {probable_cause}\n"
+                if pasos:
+                    detalle += "  → Pasos sugeridos:\n"
+                    detalle += "\n".join(f"     {i}. {paso}" for i, paso in enumerate(pasos, 1)) + "\n"
+                if alternativas:
+                    detalle += "  → Alternativas válidas:\n"
+                    detalle += "\n".join(f"     - {alt}" for alt in alternativas) + "\n"
+                if confidence is not None:
+                    detalle += f"  → Confianza estimada: {confidence:.2f}\n"
+                detalle += f"  → Modelo consultado: {respuesta['model']}"
             else:
-                titulo = "⚠  No fue posible consultar la IA"
-                detalle = (
-                    f"Detalle técnico: {msg}\n"
-                    f"Estado de IA: {error_ia or 'sin respuesta'}"
-                )
+                sugerencias_locales = sugerir_sintaxis_local(expr, variables=variables)
+                if sugerencias_locales:
+                    titulo = "⚠  IA no disponible: sugerencia local"
+                    cuerpo = "\n".join(f"  → {item}" for item in sugerencias_locales)
+                    detalle = (
+                        f"Detalle técnico: {msg}\n"
+                        f"Estado de IA: {error_ia or 'sin respuesta'}\n"
+                        f"{cuerpo}"
+                    )
+                else:
+                    titulo = "⚠  No fue posible consultar la IA"
+                    detalle = (
+                        f"Detalle técnico: {msg}\n"
+                        f"Estado de IA: {error_ia or 'sin respuesta'}"
+                    )
         else:
             cache_key = ("error", tipo, msg, expr, tuple(variables))
             respuesta = self._cache_ia.get(cache_key)
@@ -1011,12 +1401,27 @@ class App(tk.Tk):
                 respuesta = None
 
             if respuesta:
+                pasos = respuesta.get("pasos", [])
+                checklist = respuesta.get("checklist", [])
+                probable_cause = respuesta.get("probable_cause", "")
+                confidence = respuesta.get("confidence", None)
+
                 titulo = "🤖  Alerta generada por IA"
                 detalle = (
                     f"  → {respuesta['suggestion']}\n"
                     f"  → {respuesta['explanation']}\n"
-                    f"  → Modelo consultado: {respuesta['model']}"
                 )
+                if probable_cause:
+                    detalle += f"  → Causa probable: {probable_cause}\n"
+                if pasos:
+                    detalle += "  → Pasos sugeridos:\n"
+                    detalle += "\n".join(f"     {i}. {paso}" for i, paso in enumerate(pasos, 1)) + "\n"
+                if checklist:
+                    detalle += "  → Checklist rápido:\n"
+                    detalle += "\n".join(f"     - {item}" for item in checklist) + "\n"
+                if confidence is not None:
+                    detalle += f"  → Confianza estimada: {confidence:.2f}\n"
+                detalle += f"  → Modelo consultado: {respuesta['model']}"
             else:
                 titulo = "⚠  No fue posible consultar la IA"
                 detalle = (
@@ -1073,7 +1478,14 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-            cache_key = ("resultado", msg_original)
+            cache_key = (
+                "resultado",
+                msg_original,
+                contexto.get("metodo"),
+                contexto.get("expresion"),
+                contexto.get("a"),
+                contexto.get("b"),
+            )
             ayuda_ia = self._cache_ia.get(cache_key)
             error_ia = None
             if ayuda_ia is None:
@@ -1090,6 +1502,18 @@ class App(tk.Tk):
             if ayuda_ia:
                 detalle_err += f"  → {ayuda_ia['suggestion']}\n"
                 detalle_err += f"  → {ayuda_ia['explanation']}\n"
+                if ayuda_ia.get("probable_cause"):
+                    detalle_err += f"  → Causa probable: {ayuda_ia['probable_cause']}\n"
+                if ayuda_ia.get("pasos"):
+                    detalle_err += "  → Pasos sugeridos:\n"
+                    detalle_err += "\n".join(
+                        f"     {i}. {paso}" for i, paso in enumerate(ayuda_ia.get("pasos", []), 1)
+                    ) + "\n"
+                if ayuda_ia.get("checklist"):
+                    detalle_err += "  → Checklist rápido:\n"
+                    detalle_err += "\n".join(f"     - {item}" for item in ayuda_ia.get("checklist", [])) + "\n"
+                if ayuda_ia.get("confidence") is not None:
+                    detalle_err += f"  → Confianza estimada: {ayuda_ia['confidence']:.2f}\n"
                 detalle_err += f"  → Modelo consultado: {ayuda_ia['model']}"
             elif error_ia:
                 titulo_err = "⚠  No fue posible consultar la IA"
@@ -1176,10 +1600,39 @@ class App(tk.Tk):
             },
         }
 
+        PROVEEDOR_DOMINIOS = {
+            "Groq (gratuito)": {"api.groq.com"},
+            "OpenAI": {"api.openai.com"},
+            "OpenRouter (gratuito)": {"openrouter.ai", "api.openrouter.ai"},
+        }
+
+        def _validar_config_ia(proveedor: str, key: str, model: str, url: str):
+            if not key:
+                return "⚠  Ingresa una API Key válida."
+            if not model:
+                return "⚠  Especifica un nombre de modelo."
+
+            url_valida, error_url = _validar_url_api(url)
+            if not url_valida:
+                return f"⚠  {error_url}"
+
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            dominios = PROVEEDOR_DOMINIOS.get(proveedor)
+            if dominios and host not in dominios:
+                return (
+                    "⚠  La URL no coincide con el proveedor seleccionado. "
+                    "Elige 'Personalizado' o corrige la URL."
+                )
+            return ""
+
         # ── Valores actuales (de env ya cargado) ─────────────────────────
         api_key_actual = os.getenv("IA_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
         url_actual     = os.getenv("IA_API_URL") or os.getenv("OPENAI_API_URL") or ""
         model_actual   = os.getenv("IA_MODEL")   or os.getenv("OPENAI_MODEL")   or ""
+        detail_actual  = (os.getenv("IA_DETAIL_LEVEL") or "intermedio").strip().lower()
+        if detail_actual not in {"basico", "intermedio", "profundo"}:
+            detail_actual = "intermedio"
 
         # ── Proveedor ────────────────────────────────────────────────────
         row_prov = tk.Frame(frame, bg=T["BG"])
@@ -1222,6 +1675,29 @@ class App(tk.Tk):
                                insertbackground=T["TEXT"], relief="flat", bd=6, width=36)
         entry_model.pack(side="left")
 
+        # ── Nivel de detalle de respuestas IA ───────────────────────────
+        row_detail = tk.Frame(frame, bg=T["BG"])
+        row_detail.pack(anchor="w", padx=30, pady=3)
+        tk.Label(row_detail, text="Nivel de detalle IA:", font=("Segoe UI", 9),
+                 bg=T["BG"], fg=T["SUBTEXT"], width=26, anchor="w").pack(side="left")
+
+        DETAIL_OPTIONS = {
+            "Básico": "basico",
+            "Intermedio": "intermedio",
+            "Profundo": "profundo",
+        }
+        inv_detail = {v: k for k, v in DETAIL_OPTIONS.items()}
+        var_detail = tk.StringVar(value=inv_detail.get(detail_actual, "Intermedio"))
+        combo_detail = ttk.Combobox(
+            row_detail,
+            textvariable=var_detail,
+            values=list(DETAIL_OPTIONS.keys()),
+            state="readonly",
+            font=("Segoe UI", 10),
+            width=28,
+        )
+        combo_detail.pack(side="left")
+
         # ── URL de la API (avanzado) ──────────────────────────────────────
         var_url = tk.StringVar(value=url_actual or "https://api.groq.com/openai/v1/chat/completions")
         row_url = tk.Frame(frame, bg=T["BG"])
@@ -1258,19 +1734,21 @@ class App(tk.Tk):
             key   = var_key.get().strip()
             model = var_model.get().strip()
             url   = var_url.get().strip()
-            if not key:
-                lbl_estado.config(text="⚠  Ingresa una API Key válida.", fg=T["YELLOW"])
+            proveedor = var_prov.get()
+            detail_level = DETAIL_OPTIONS.get(var_detail.get(), "intermedio")
+            error_cfg = _validar_config_ia(proveedor, key, model, url)
+            if error_cfg:
+                lbl_estado.config(text=error_cfg, fg=T["YELLOW"])
                 return
-            if not url:
-                lbl_estado.config(text="⚠  La URL de la API no puede estar vacía.", fg=T["YELLOW"])
-                return
-            if not model:
-                lbl_estado.config(text="⚠  Especifica un nombre de modelo.", fg=T["YELLOW"])
-                return
-            _guardar_env({"IA_API_KEY": key, "IA_API_URL": url, "IA_MODEL": model})
+            _guardar_env({
+                "IA_API_KEY": key,
+                "IA_API_URL": url,
+                "IA_MODEL": model,
+                "IA_DETAIL_LEVEL": detail_level,
+            })
             self._cache_ia.clear()   # limpia caché para usar nueva config
             lbl_estado.config(
-                text=f"✔  Configuración guardada en .env  —  Modelo: {model}",
+                text=f"✔  Configuración guardada en .env  —  Modelo: {model} · Detalle: {detail_level}",
                 fg=T["GREEN"]
             )
 
@@ -1278,16 +1756,43 @@ class App(tk.Tk):
             key = var_key.get().strip()
             url = var_url.get().strip()
             model = var_model.get().strip()
-            if not key:
-                lbl_estado.config(text="⚠  Ingresa una API Key antes de probar.", fg=T["YELLOW"])
+            proveedor = var_prov.get()
+            detail_level = DETAIL_OPTIONS.get(var_detail.get(), "intermedio")
+            error_cfg = _validar_config_ia(proveedor, key, model, url)
+            if error_cfg:
+                lbl_estado.config(text=error_cfg, fg=T["YELLOW"])
                 return
             lbl_estado.config(text="… Probando conexión con la IA …", fg=T["SUBTEXT"])
             frame.update_idletasks()
+
+            prev_key = os.environ.get("IA_API_KEY")
+            prev_url = os.environ.get("IA_API_URL")
+            prev_model = os.environ.get("IA_MODEL")
+            prev_detail = os.environ.get("IA_DETAIL_LEVEL")
             # Guarda temporalmente para que consultar_ia_sintaxis las use
             os.environ["IA_API_KEY"]  = key
             os.environ["IA_API_URL"]  = url
             os.environ["IA_MODEL"]    = model
+            os.environ["IA_DETAIL_LEVEL"] = detail_level
             resultado, err = consultar_ia_sintaxis("2x+1", "sintaxis de prueba")
+
+            if prev_key is None:
+                os.environ.pop("IA_API_KEY", None)
+            else:
+                os.environ["IA_API_KEY"] = prev_key
+            if prev_url is None:
+                os.environ.pop("IA_API_URL", None)
+            else:
+                os.environ["IA_API_URL"] = prev_url
+            if prev_model is None:
+                os.environ.pop("IA_MODEL", None)
+            else:
+                os.environ["IA_MODEL"] = prev_model
+            if prev_detail is None:
+                os.environ.pop("IA_DETAIL_LEVEL", None)
+            else:
+                os.environ["IA_DETAIL_LEVEL"] = prev_detail
+
             if resultado:
                 lbl_estado.config(
                     text=f"✔  Conexión exitosa.  Respuesta del modelo: {resultado.get('suggestion', 'ok')}",
@@ -1314,7 +1819,8 @@ class App(tk.Tk):
         tk.Frame(frame, bg=T["SURFACE"], height=1).pack(fill="x", padx=30, pady=(14, 4))
         nota = (
             "ℹ  La configuración se guarda en el archivo .env de este proyecto.\n"
-            "   Groq ofrece una API gratuita en: console.groq.com  →  Crea cuenta → API Keys → Create API Key"
+            "   Groq ofrece una API gratuita en: console.groq.com  →  Crea cuenta → API Keys → Create API Key\n"
+            "   Tip: usa detalle 'Profundo' si quieres respuestas más explicativas."
         )
         tk.Label(frame, text=nota, font=("Segoe UI", 8), bg=T["BG"],
                  fg=T["SUBTEXT"], anchor="w", justify="left", wraplength=580).pack(anchor="w", padx=30, pady=4)
